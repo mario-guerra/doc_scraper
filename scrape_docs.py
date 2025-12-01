@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote
-from typing import Set, List, Dict, Tuple
+from typing import Set, List, Dict, Tuple, Optional
 
 try:
     import requests
@@ -44,7 +44,10 @@ class DocumentationScraper:
         output_dir: str = "scraped_docs",
         exclude_selectors: List[str] = None,
         delay: float = 1.0,
-        download_images: bool = True
+        download_images: bool = True,
+        single_page: bool = False,
+        cookies: Optional[str] = None,
+        cookie_file: Optional[str] = None
     ):
         """
         Initialize the scraper.
@@ -55,6 +58,9 @@ class DocumentationScraper:
             exclude_selectors: CSS selectors for elements to exclude (header, footer, nav)
             delay: Delay between requests in seconds (be respectful!)
             download_images: Download and save images locally
+            single_page: If True, only scrape the provided URL (don't follow links)
+            cookies: Cookie string in format "name1=value1; name2=value2"
+            cookie_file: Path to a file containing cookies (Netscape format or cookie string)
         """
         self.base_url = base_url
         self.output_dir = Path(output_dir)
@@ -63,11 +69,17 @@ class DocumentationScraper:
         self.delay = delay
         self.visited_urls: Set[str] = set()
         self.download_images = download_images
+        self.single_page = single_page
         self.downloaded_images: Dict[str, str] = {}  # URL -> local path mapping
+        self.cookies = cookies
+        self.cookie_file = cookie_file
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
         })
+        
+        # Load and apply cookies if provided
+        self._load_cookies()
         
         # Configure html2text for clean markdown
         self.html_converter = html2text.HTML2Text()
@@ -75,6 +87,68 @@ class DocumentationScraper:
         self.html_converter.ignore_images = False
         self.html_converter.body_width = 0  # Don't wrap lines
         self.html_converter.single_line_break = False
+    
+    def _load_cookies(self):
+        """Load cookies from string or file and apply to session."""
+        cookie_dict = {}
+        
+        if self.cookie_file:
+            try:
+                with open(self.cookie_file, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    cookie_dict = self._parse_cookie_string(content)
+                    print(f"✓ Loaded cookies from file: {self.cookie_file}")
+            except Exception as e:
+                print(f"Warning: Could not load cookies from file: {e}")
+        
+        if self.cookies:
+            parsed = self._parse_cookie_string(self.cookies)
+            cookie_dict.update(parsed)
+            print(f"✓ Loaded cookies from command line")
+        
+        if cookie_dict:
+            for name, value in cookie_dict.items():
+                self.session.cookies.set(name, value)
+    
+    def _parse_cookie_string(self, cookie_string: str) -> Dict[str, str]:
+        """Parse cookie string in various formats."""
+        cookie_dict = {}
+        if not cookie_string:
+            return cookie_dict
+        
+        try:
+            cookie_string = cookie_string.strip()
+            if cookie_string.startswith('#'):
+                # Netscape format
+                for line in cookie_string.split('\n'):
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        parts = line.split('\t')
+                        if len(parts) >= 7:
+                            cookie_dict[parts[5]] = parts[6]
+            elif '\t' in cookie_string:
+                # Tab-separated format (name, value, ...) - common in browser extensions
+                for line in cookie_string.split('\n'):
+                    line = line.strip()
+                    if line:
+                        parts = line.split('\t')
+                        if len(parts) >= 2:
+                            # First two columns are name and value
+                            name = parts[0].strip()
+                            value = parts[1].strip()
+                            if name and value:
+                                cookie_dict[name] = value
+            else:
+                # Simple cookie string format
+                for item in cookie_string.split(';'):
+                    item = item.strip()
+                    if '=' in item:
+                        name, value = item.split('=', 1)
+                        cookie_dict[name.strip()] = value.strip()
+        except Exception as e:
+            print(f"Warning: Error parsing cookies: {e}")
+        
+        return cookie_dict
         
     def fetch_page(self, url: str) -> BeautifulSoup:
         """Fetch and parse a page."""
@@ -372,33 +446,45 @@ class DocumentationScraper:
         2. Extract content links
         3. Scrape each linked page
         """
+        mode = "Single page" if self.single_page else "Multi-page"
         print(f"Starting scrape of: {self.base_url}")
+        print(f"Mode: {mode}")
         print(f"Output directory: {self.output_dir.absolute()}")
         print(f"Image downloads: {'Enabled' if self.download_images else 'Disabled'}")
         print(f"Excluding selectors: {', '.join(self.exclude_selectors)}")
         print("-" * 60)
         
-        # Fetch the base page
-        soup = self.fetch_page(self.base_url)
-        if not soup:
-            print("Failed to fetch base page. Exiting.")
-            return
-        
-        # Extract links from the base page
-        content_links = self.extract_content_links(soup, self.base_url)
-        print(f"Found {len(content_links)} content links to scrape")
-        print("-" * 60)
-        
-        # Scrape each linked page
-        successful = 0
-        for i, link in enumerate(content_links, 1):
-            print(f"[{i}/{len(content_links)}] ", end="")
-            if self.scrape_page(link):
-                successful += 1
+        if self.single_page:
+            # Single page mode - just scrape the provided URL
+            print("Scraping single page (no link following)...")
+            print("-" * 60)
+            success = self.scrape_page(self.base_url)
+            successful = 1 if success else 0
+            total = 1
+        else:
+            # Multi-page mode - extract links and follow them
+            # Fetch the base page
+            soup = self.fetch_page(self.base_url)
+            if not soup:
+                print("Failed to fetch base page. Exiting.")
+                return
+            
+            # Extract links from the base page
+            content_links = self.extract_content_links(soup, self.base_url)
+            print(f"Found {len(content_links)} content links to scrape")
+            print("-" * 60)
+            
+            # Scrape each linked page
+            successful = 0
+            for i, link in enumerate(content_links, 1):
+                print(f"[{i}/{len(content_links)}] ", end="")
+                if self.scrape_page(link):
+                    successful += 1
+            total = len(content_links)
         
         print("-" * 60)
         print(f"Scraping complete!")
-        print(f"Successfully scraped: {successful}/{len(content_links)} pages")
+        print(f"Successfully scraped: {successful}/{total} page(s)")
         if self.download_images:
             print(f"Downloaded images: {len(self.downloaded_images)}")
             if len(self.downloaded_images) > 0:
@@ -457,6 +543,19 @@ Examples:
         action='store_true',
         help='Disable image downloading'
     )
+    parser.add_argument(
+        '--single-page', '-s',
+        action='store_true',
+        help='Scrape only the provided URL (do not follow links)'
+    )
+    parser.add_argument(
+        '--cookies', '-c',
+        help='Cookie string in format "name1=value1; name2=value2"'
+    )
+    parser.add_argument(
+        '--cookie-file',
+        help='Path to file containing cookies (Netscape format or cookie string)'
+    )
     
     args = parser.parse_args()
     
@@ -472,7 +571,10 @@ Examples:
         output_dir=args.output_dir,
         exclude_selectors=args.exclude_selectors,
         delay=args.delay,
-        download_images=not args.no_images
+        download_images=not args.no_images,
+        single_page=args.single_page,
+        cookies=args.cookies,
+        cookie_file=args.cookie_file
     )
     
     try:
