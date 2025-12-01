@@ -1,0 +1,36 @@
+# Python virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Scraped content directories
+*_content/
+scraped_docs/
+
+# Sensitive files
+cookies.txt
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE
+.tmp/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
