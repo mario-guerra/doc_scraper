@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Dynamic Documentation Scraper - Handles JavaScript-rendered pages.
+Dynamic Documentation Scraper - Handles JavaScript-rendered pages and Confluence Cloud.
 
 This enhanced version uses Selenium to handle pages that load content dynamically.
 Perfect for modern documentation sites like Microsoft Learn that use JavaScript.
+
+For Confluence Cloud (*.atlassian.net/wiki/...) URLs, the scraper automatically
+uses the Confluence REST API instead of Selenium for faster, more reliable extraction.
 
 Usage:
     python scrape_docs_dynamic.py <url> [--output-dir <dir>] [--exclude-selector <css>]
@@ -122,6 +125,7 @@ class DynamicDocumentationScraper:
     def _load_cookies(self):
         """Load cookies from string or file and apply to session."""
         cookie_dict = {}
+        self._cookies_with_domains: List[Dict[str, str]] = []
         
         if self.cookie_file:
             # Load from file
@@ -129,7 +133,8 @@ class DynamicDocumentationScraper:
                 with open(self.cookie_file, 'r', encoding='utf-8') as f:
                     content = f.read().strip()
                     cookie_dict = self._parse_cookie_string(content)
-                    print(f"✓ Loaded cookies from file: {self.cookie_file}")
+                    self._cookies_with_domains = self._parse_cookies_with_domains(content)
+                    print(f"✓ Loaded {len(self._cookies_with_domains)} cookies from file: {self.cookie_file}")
             except Exception as e:
                 print(f"Warning: Could not load cookies from file: {e}")
         
@@ -137,6 +142,9 @@ class DynamicDocumentationScraper:
             # Load from string
             parsed = self._parse_cookie_string(self.cookies)
             cookie_dict.update(parsed)
+            self._cookies_with_domains.extend(
+                self._parse_cookies_with_domains(self.cookies)
+            )
             print(f"✓ Loaded cookies from command line")
         
         # Apply cookies to requests session
@@ -146,80 +154,371 @@ class DynamicDocumentationScraper:
     
     def _parse_cookie_string(self, cookie_string: str) -> Dict[str, str]:
         """
-        Parse cookie string in various formats.
+        Parse cookie string in various formats (without domain info).
         
         Supports:
         - "name1=value1; name2=value2"
         - Netscape format (from browser exports)
-        - JSON format
+        - Tab-separated browser extension format
         """
-        cookie_dict = {}
+        cookies_with_domains = self._parse_cookies_with_domains(cookie_string)
+        return {c['name']: c['value'] for c in cookies_with_domains}
+    
+    def _parse_cookies_with_domains(self, cookie_string: str) -> List[Dict[str, str]]:
+        """
+        Parse cookie string and return list of dicts with name, value, domain, and path.
+        
+        Supports:
+        - "name1=value1; name2=value2" (no domain info)
+        - Netscape format (domain, flag, path, secure, expiration, name, value)
+        - Tab-separated browser extension format (name, value, domain, path, ...)
+        """
+        cookies = []
         
         if not cookie_string:
-            return cookie_dict
+            return cookies
         
-        # Try parsing as simple cookie string
         try:
-            # Remove any leading/trailing whitespace
             cookie_string = cookie_string.strip()
             
-            # Check if it's Netscape format (starts with #)
             if cookie_string.startswith('#'):
-                # Parse Netscape format
+                # Netscape format
                 for line in cookie_string.split('\n'):
                     line = line.strip()
                     if line and not line.startswith('#'):
                         parts = line.split('\t')
                         if len(parts) >= 7:
-                            # Netscape format: domain, flag, path, secure, expiration, name, value
-                            name = parts[5]
-                            value = parts[6]
-                            cookie_dict[name] = value
+                            cookies.append({
+                                'name': parts[5],
+                                'value': parts[6],
+                                'domain': parts[0],
+                                'path': parts[2] if len(parts) > 2 else '/'
+                            })
             elif '\t' in cookie_string:
-                # Tab-separated format (name, value, ...) - common in browser extensions
+                # Tab-separated browser extension format: name, value, domain, path, ...
                 for line in cookie_string.split('\n'):
                     line = line.strip()
-                    if line:
+                    if line and not line.startswith('#'):
                         parts = line.split('\t')
                         if len(parts) >= 2:
-                            # First two columns are name and value
                             name = parts[0].strip()
                             value = parts[1].strip()
+                            domain = parts[2].strip() if len(parts) > 2 else ''
+                            path = parts[3].strip() if len(parts) > 3 else '/'
                             if name and value:
-                                cookie_dict[name] = value
+                                cookies.append({
+                                    'name': name,
+                                    'value': value,
+                                    'domain': domain,
+                                    'path': path
+                                })
             else:
-                # Parse simple cookie string format
+                # Simple cookie string format
                 for item in cookie_string.split(';'):
                     item = item.strip()
                     if '=' in item:
                         name, value = item.split('=', 1)
-                        cookie_dict[name.strip()] = value.strip()
+                        cookies.append({
+                            'name': name.strip(),
+                            'value': value.strip(),
+                            'domain': '',
+                            'path': '/'
+                        })
         except Exception as e:
             print(f"Warning: Error parsing cookies: {e}")
         
-        return cookie_dict
+        return cookies
     
+    # ── Confluence REST API Support ──────────────────────────────────────
+
+    def _is_confluence_url(self, url: str) -> bool:
+        """Detect if a URL points to Confluence Cloud or Server."""
+        parsed = urlparse(url)
+        hostname = parsed.netloc.lower()
+        path = parsed.path.lower()
+        return (
+            'atlassian.net' in hostname and '/wiki/' in path
+        ) or (
+            '/wiki/spaces/' in path or '/wiki/display/' in path
+            or '/wiki/rest/api/' in path
+        )
+
+    def _extract_confluence_info(self, url: str) -> Dict[str, str]:
+        """
+        Extract page ID and space key from a Confluence URL.
+
+        Supports URL formats:
+          .../wiki/spaces/{SPACE}/pages/{ID}/Title
+          .../wiki/spaces/{SPACE}/pages/{ID}
+        """
+        parsed = urlparse(url)
+        path = parsed.path
+        info: Dict[str, str] = {'page_id': '', 'space_key': ''}
+
+        # /wiki/spaces/SPACE/pages/ID/...
+        m = re.search(r'/wiki/spaces/([^/]+)/pages/(\d+)', path)
+        if m:
+            info['space_key'] = m.group(1)
+            info['page_id'] = m.group(2)
+            return info
+
+        # /wiki/display/SPACE/Title  (legacy)
+        m = re.search(r'/wiki/display/([^/]+)/(.+)', path)
+        if m:
+            info['space_key'] = m.group(1)
+            return info
+
+        return info
+
+    def _confluence_api_get(self, endpoint: str) -> Optional[Dict]:
+        """Call a Confluence REST API endpoint and return JSON."""
+        base = urlparse(self.base_url)
+        api_url = f"{base.scheme}://{base.netloc}{endpoint}"
+        try:
+            r = self.session.get(api_url, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            print(f"  ✗ API error ({endpoint}): {e}")
+            return None
+
+    def _confluence_get_page(self, page_id: str) -> Optional[Dict]:
+        """Fetch a Confluence page by ID with body content."""
+        return self._confluence_api_get(
+            f"/wiki/rest/api/content/{page_id}?expand=body.storage"
+        )
+
+    def _confluence_search_page(self, title: str, space_key: str) -> Optional[Dict]:
+        """Find a Confluence page by title within a space."""
+        from urllib.parse import quote
+        data = self._confluence_api_get(
+            f"/wiki/rest/api/content?title={quote(title)}"
+            f"&spaceKey={space_key}&expand=body.storage"
+        )
+        if data and data.get('results'):
+            return data['results'][0]
+        return None
+
+    def _confluence_extract_links(self, body_html: str) -> List[str]:
+        """Parse Confluence storage-format HTML and return linked page titles."""
+        soup = BeautifulSoup(body_html, 'html.parser')
+        titles: List[str] = []
+        seen: Set[str] = set()
+        for ri_page in soup.find_all('ri:page'):
+            title = ri_page.get('ri:content-title')
+            if title and title not in seen:
+                titles.append(title)
+                seen.add(title)
+        return titles
+
+    def _confluence_process_images(
+        self, soup: BeautifulSoup, page_id: str, page_url: str
+    ) -> BeautifulSoup:
+        """
+        Convert Confluence image macros (ac:image) into standard <img> tags
+        and optionally download the images.
+        """
+        base = urlparse(self.base_url)
+        base_url = f"{base.scheme}://{base.netloc}"
+
+        for ac_image in soup.find_all('ac:image'):
+            ri_url = ac_image.find('ri:url')
+            ri_attachment = ac_image.find('ri:attachment')
+
+            if ri_url:
+                src = ri_url.get('ri:value', '')
+                if src and self.download_images:
+                    success, local = self.download_image(src, page_url)
+                    src = local if success else src
+                new_img = soup.new_tag('img', src=src)
+                ac_image.replace_with(new_img)
+
+            elif ri_attachment:
+                filename = ri_attachment.get('ri:filename', '')
+                if filename:
+                    att_data = self._confluence_api_get(
+                        f"/wiki/rest/api/content/{page_id}/child/attachment"
+                        f"?filename={requests.utils.quote(filename)}"
+                    )
+                    dl_path = ''
+                    if att_data and att_data.get('results'):
+                        dl_path = (
+                            att_data['results'][0]
+                            .get('_links', {})
+                            .get('download', '')
+                        )
+                    if dl_path and self.download_images:
+                        full_url = f"{base_url}/wiki{dl_path}"
+                        success, local = self.download_image(full_url, page_url)
+                        new_img = soup.new_tag(
+                            'img',
+                            src=local if success else full_url,
+                            alt=filename
+                        )
+                    else:
+                        new_img = soup.new_tag('img', src='', alt=filename)
+                    ac_image.replace_with(new_img)
+
+        # Also handle standard <img> tags
+        if self.download_images:
+            for img in soup.find_all('img'):
+                src = img.get('src')
+                if src and not src.startswith('data:') and not src.startswith('images/'):
+                    success, local = self.download_image(src, page_url)
+                    if success:
+                        img['src'] = local
+
+        return soup
+
+    def _sanitize_title_filename(self, title: str) -> str:
+        """Create a safe filename from a page title."""
+        filename = re.sub(r'[^\w\-_ ]', '', title)
+        filename = filename.strip().replace(' ', '_')
+        if len(filename) > 200:
+            filename = filename[:200]
+        return f"{filename}.md"
+
+    def scrape_confluence_api(self):
+        """
+        Scrape Confluence documentation via the REST API.
+
+        This is faster and more reliable than rendering Confluence Cloud's
+        React UI through Selenium.
+        """
+        info = self._extract_confluence_info(self.base_url)
+        page_id = info['page_id']
+        space_key = info['space_key']
+
+        if not page_id:
+            print("  ✗ Could not extract page ID from URL")
+            print("    Expected format: .../wiki/spaces/SPACE/pages/PAGE_ID/Title")
+            return
+
+        # Fetch the starting page
+        print(f"Fetching page via Confluence API (page ID: {page_id})...")
+        page_data = self._confluence_get_page(page_id)
+        if not page_data:
+            print("  ✗ Failed to fetch page. Check cookies / permissions.")
+            return
+
+        title = page_data.get('title', 'Untitled')
+        body = page_data.get('body', {}).get('storage', {}).get('value', '')
+        base_parsed = urlparse(self.base_url)
+        base_origin = f"{base_parsed.scheme}://{base_parsed.netloc}"
+        page_url = f"{base_origin}/wiki/spaces/{space_key}/pages/{page_id}"
+
+        print(f"  Title: {title}")
+        print(f"  Body: {len(body)} characters")
+
+        # Save the starting page
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+
+        page_soup = BeautifulSoup(body, 'html.parser')
+        page_soup = self._confluence_process_images(page_soup, page_id, page_url)
+        md = self.html_to_markdown(page_soup)
+        fn = self._sanitize_title_filename(title)
+        with open(self.output_dir / fn, 'w', encoding='utf-8') as f:
+            f.write(f"# Source: {page_url}\n# Title: {title}\n\n---\n\n{md}")
+        print(f"  ✓ Saved: {fn}")
+
+        if self.single_page:
+            print("-" * 60)
+            print("Scraping complete! 1/1 page(s)")
+            print(f"Files saved to: {self.output_dir.absolute()}")
+            return
+
+        # Extract linked pages from the body
+        linked_titles = self._confluence_extract_links(body)
+        print(f"\nFound {len(linked_titles)} linked pages to scrape")
+        print("-" * 60)
+
+        if not linked_titles:
+            print("No linked pages found in the content.")
+            print(f"Files saved to: {self.output_dir.absolute()}")
+            return
+
+        successful = 0
+        for i, link_title in enumerate(linked_titles, 1):
+            print(f"[{i}/{len(linked_titles)}] Fetching: {link_title}")
+
+            linked_page = self._confluence_search_page(link_title, space_key)
+            if not linked_page:
+                print(f"  ✗ Page not found: {link_title}")
+                continue
+
+            lp_body = linked_page.get('body', {}).get('storage', {}).get('value', '')
+            lp_id = linked_page['id']
+            lp_title = linked_page.get('title', link_title)
+            lp_url = f"{base_origin}/wiki/spaces/{space_key}/pages/{lp_id}"
+
+            lp_soup = BeautifulSoup(lp_body, 'html.parser')
+            lp_soup = self._confluence_process_images(lp_soup, lp_id, lp_url)
+            lp_md = self.html_to_markdown(lp_soup)
+            lp_fn = self._sanitize_title_filename(lp_title)
+
+            with open(self.output_dir / lp_fn, 'w', encoding='utf-8') as f:
+                f.write(
+                    f"# Source: {lp_url}\n# Title: {lp_title}\n\n---\n\n{lp_md}"
+                )
+            print(f"  ✓ Saved: {lp_fn} ({len(lp_md)} chars)")
+            successful += 1
+
+            time.sleep(self.delay)
+
+        print("-" * 60)
+        print(f"Scraping complete! {successful}/{len(linked_titles)} page(s)")
+        if self.download_images:
+            print(f"Downloaded images: {len(self.downloaded_images)}")
+        print(f"Files saved to: {self.output_dir.absolute()}")
+
+    # ── Selenium Cookie Handling ─────────────────────────────────────────
+
     def _apply_selenium_cookies(self, url: str):
-        """Apply cookies to Selenium browser."""
-        if not self.driver or not self.session.cookies:
+        """Apply cookies to Selenium browser using CDP for multi-domain support."""
+        if not self.driver:
+            return
+        
+        cookies_to_apply = self._cookies_with_domains if self._cookies_with_domains else []
+        
+        # Fallback to session cookies if no domain-aware cookies available
+        if not cookies_to_apply and self.session.cookies:
+            parsed = urlparse(url)
+            for cookie in self.session.cookies:
+                cookies_to_apply.append({
+                    'name': cookie.name,
+                    'value': cookie.value,
+                    'domain': parsed.netloc,
+                    'path': '/'
+                })
+        
+        if not cookies_to_apply:
             return
         
         try:
-            # Parse domain from URL
-            parsed = urlparse(url)
-            domain = parsed.netloc
-            
-            # Add cookies to browser
-            for cookie in self.session.cookies:
+            applied = 0
+            failed = 0
+            for cookie_info in cookies_to_apply:
                 try:
-                    # Selenium cookie format
-                    self.driver.add_cookie({
-                        'name': cookie.name,
-                        'value': cookie.value,
-                        'domain': domain
-                    })
+                    domain = cookie_info.get('domain', '')
+                    # Use CDP Network.setCookie to set cookies for any domain
+                    cdp_cookie = {
+                        'name': cookie_info['name'],
+                        'value': cookie_info['value'],
+                        'path': cookie_info.get('path', '/'),
+                    }
+                    if domain:
+                        cdp_cookie['domain'] = domain
+                    else:
+                        cdp_cookie['domain'] = urlparse(url).netloc
+                    
+                    self.driver.execute_cdp_cmd('Network.setCookie', cdp_cookie)
+                    applied += 1
                 except Exception as e:
-                    print(f"    Warning: Could not add cookie {cookie.name}: {e}")
+                    failed += 1
+            
+            print(f"    Applied {applied} cookies via CDP" + 
+                  (f" ({failed} failed)" if failed else ""))
         except Exception as e:
             print(f"Warning: Error applying cookies to browser: {e}")
         
@@ -239,6 +538,8 @@ class DynamicDocumentationScraper:
             chrome_options.add_argument('--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36')
             
             self.driver = webdriver.Chrome(options=chrome_options)
+            # Enable CDP Network domain for cookie management
+            self.driver.execute_cdp_cmd('Network.enable', {})
             print("✓ Selenium WebDriver initialized (JavaScript support enabled)")
             return True
         except WebDriverException as e:
@@ -256,15 +557,14 @@ class DynamicDocumentationScraper:
     def fetch_page_selenium(self, url: str, wait_time: int = 10) -> BeautifulSoup:
         """Fetch and parse a page using Selenium (handles JavaScript)."""
         try:
-            # First load the page to set domain
-            self.driver.get(url)
-            
-            # Apply cookies if we haven't already (first page load)
-            if self.session.cookies and not hasattr(self, '_cookies_applied'):
+            # Apply cookies via CDP before first navigation (no domain restriction)
+            if not hasattr(self, '_cookies_applied') and (self._cookies_with_domains or self.session.cookies):
+                print(f"    Setting cookies via CDP before navigation...")
                 self._apply_selenium_cookies(url)
                 self._cookies_applied = True
-                # Reload page with cookies
-                self.driver.get(url)
+            
+            # Navigate to the page (cookies already set)
+            self.driver.get(url)
             
             # Wait for page to load - look for common content indicators
             try:
@@ -669,8 +969,16 @@ class DynamicDocumentationScraper:
         print(f"Starting scrape of: {self.base_url}")
         print(f"Mode: {mode}")
         print(f"Output directory: {self.output_dir.absolute()}")
-        print(f"Scraper: {'Dynamic (Selenium)' if self.use_selenium else 'Static (Requests)'}")
         print(f"Image downloads: {'Enabled' if self.download_images else 'Disabled'}")
+
+        # Confluence Cloud: prefer the REST API over Selenium scraping
+        if self._is_confluence_url(self.base_url):
+            print(f"Scraper: Confluence REST API (auto-detected)")
+            print("-" * 60)
+            self.scrape_confluence_api()
+            return
+
+        print(f"Scraper: {'Dynamic (Selenium)' if self.use_selenium else 'Static (Requests)'}")
         print(f"Excluding selectors: {', '.join(self.exclude_selectors)}")
         print("-" * 60)
         
@@ -737,6 +1045,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Confluence Cloud (auto-detected, uses REST API)
+  python scrape_docs_dynamic.py https://mysite.atlassian.net/wiki/spaces/DOC/pages/123/TOC \\
+    --cookie-file cookies.txt -o my_docs
+
   # Use Selenium for JavaScript-heavy sites
   python scrape_docs_dynamic.py https://learn.microsoft.com/collections/xyz
   

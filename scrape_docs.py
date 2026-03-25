@@ -9,6 +9,9 @@ This script:
 4. Converts content to markdown
 5. Saves each page as a separate markdown file
 
+For Confluence Cloud (*.atlassian.net/wiki/...) URLs, the scraper automatically
+uses the Confluence REST API for faster, more reliable extraction.
+
 Usage:
     python scrape_docs.py <url> [--output-dir <dir>] [--exclude-selector <css>]
 """
@@ -149,7 +152,246 @@ class DocumentationScraper:
             print(f"Warning: Error parsing cookies: {e}")
         
         return cookie_dict
-        
+
+    # ── Confluence REST API Support ──────────────────────────────────────
+
+    def _is_confluence_url(self, url: str) -> bool:
+        """Detect if a URL points to Confluence Cloud or Server."""
+        parsed = urlparse(url)
+        hostname = parsed.netloc.lower()
+        path = parsed.path.lower()
+        return (
+            'atlassian.net' in hostname and '/wiki/' in path
+        ) or (
+            '/wiki/spaces/' in path or '/wiki/display/' in path
+            or '/wiki/rest/api/' in path
+        )
+
+    def _extract_confluence_info(self, url: str) -> Dict[str, str]:
+        """
+        Extract page ID and space key from a Confluence URL.
+
+        Supports URL formats:
+          .../wiki/spaces/{SPACE}/pages/{ID}/Title
+          .../wiki/spaces/{SPACE}/pages/{ID}
+        """
+        parsed = urlparse(url)
+        path = parsed.path
+        info: Dict[str, str] = {'page_id': '', 'space_key': ''}
+
+        m = re.search(r'/wiki/spaces/([^/]+)/pages/(\d+)', path)
+        if m:
+            info['space_key'] = m.group(1)
+            info['page_id'] = m.group(2)
+            return info
+
+        m = re.search(r'/wiki/display/([^/]+)/(.+)', path)
+        if m:
+            info['space_key'] = m.group(1)
+            return info
+
+        return info
+
+    def _confluence_api_get(self, endpoint: str) -> Optional[Dict]:
+        """Call a Confluence REST API endpoint and return JSON."""
+        base = urlparse(self.base_url)
+        api_url = f"{base.scheme}://{base.netloc}{endpoint}"
+        try:
+            r = self.session.get(api_url, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            print(f"  ✗ API error ({endpoint}): {e}")
+            return None
+
+    def _confluence_get_page(self, page_id: str) -> Optional[Dict]:
+        """Fetch a Confluence page by ID with body content."""
+        return self._confluence_api_get(
+            f"/wiki/rest/api/content/{page_id}?expand=body.storage"
+        )
+
+    def _confluence_search_page(self, title: str, space_key: str) -> Optional[Dict]:
+        """Find a Confluence page by title within a space."""
+        from urllib.parse import quote
+        data = self._confluence_api_get(
+            f"/wiki/rest/api/content?title={quote(title)}"
+            f"&spaceKey={space_key}&expand=body.storage"
+        )
+        if data and data.get('results'):
+            return data['results'][0]
+        return None
+
+    def _confluence_extract_links(self, body_html: str) -> List[str]:
+        """Parse Confluence storage-format HTML and return linked page titles."""
+        soup = BeautifulSoup(body_html, 'html.parser')
+        titles: List[str] = []
+        seen: Set[str] = set()
+        for ri_page in soup.find_all('ri:page'):
+            title = ri_page.get('ri:content-title')
+            if title and title not in seen:
+                titles.append(title)
+                seen.add(title)
+        return titles
+
+    def _confluence_process_images(
+        self, soup: BeautifulSoup, page_id: str, page_url: str
+    ) -> BeautifulSoup:
+        """
+        Convert Confluence image macros (ac:image) into standard <img> tags
+        and optionally download the images.
+        """
+        base = urlparse(self.base_url)
+        base_url = f"{base.scheme}://{base.netloc}"
+
+        for ac_image in soup.find_all('ac:image'):
+            ri_url = ac_image.find('ri:url')
+            ri_attachment = ac_image.find('ri:attachment')
+
+            if ri_url:
+                src = ri_url.get('ri:value', '')
+                if src and self.download_images:
+                    success, local = self.download_image(src, page_url)
+                    src = local if success else src
+                new_img = soup.new_tag('img', src=src)
+                ac_image.replace_with(new_img)
+
+            elif ri_attachment:
+                filename = ri_attachment.get('ri:filename', '')
+                if filename:
+                    att_data = self._confluence_api_get(
+                        f"/wiki/rest/api/content/{page_id}/child/attachment"
+                        f"?filename={requests.utils.quote(filename)}"
+                    )
+                    dl_path = ''
+                    if att_data and att_data.get('results'):
+                        dl_path = (
+                            att_data['results'][0]
+                            .get('_links', {})
+                            .get('download', '')
+                        )
+                    if dl_path and self.download_images:
+                        full_url = f"{base_url}/wiki{dl_path}"
+                        success, local = self.download_image(full_url, page_url)
+                        new_img = soup.new_tag(
+                            'img',
+                            src=local if success else full_url,
+                            alt=filename
+                        )
+                    else:
+                        new_img = soup.new_tag('img', src='', alt=filename)
+                    ac_image.replace_with(new_img)
+
+        # Also handle standard <img> tags
+        if self.download_images:
+            for img in soup.find_all('img'):
+                src = img.get('src')
+                if src and not src.startswith('data:') and not src.startswith('images/'):
+                    success, local = self.download_image(src, page_url)
+                    if success:
+                        img['src'] = local
+
+        return soup
+
+    def _sanitize_title_filename(self, title: str) -> str:
+        """Create a safe filename from a page title."""
+        filename = re.sub(r'[^\w\-_ ]', '', title)
+        filename = filename.strip().replace(' ', '_')
+        if len(filename) > 200:
+            filename = filename[:200]
+        return f"{filename}.md"
+
+    def scrape_confluence_api(self):
+        """
+        Scrape Confluence documentation via the REST API.
+
+        This is faster and more reliable than scraping Confluence's rendered HTML.
+        """
+        info = self._extract_confluence_info(self.base_url)
+        page_id = info['page_id']
+        space_key = info['space_key']
+
+        if not page_id:
+            print("  ✗ Could not extract page ID from URL")
+            print("    Expected format: .../wiki/spaces/SPACE/pages/PAGE_ID/Title")
+            return
+
+        print(f"Fetching page via Confluence API (page ID: {page_id})...")
+        page_data = self._confluence_get_page(page_id)
+        if not page_data:
+            print("  ✗ Failed to fetch page. Check cookies / permissions.")
+            return
+
+        title = page_data.get('title', 'Untitled')
+        body = page_data.get('body', {}).get('storage', {}).get('value', '')
+        base_parsed = urlparse(self.base_url)
+        base_origin = f"{base_parsed.scheme}://{base_parsed.netloc}"
+        page_url = f"{base_origin}/wiki/spaces/{space_key}/pages/{page_id}"
+
+        print(f"  Title: {title}")
+        print(f"  Body: {len(body)} characters")
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+
+        page_soup = BeautifulSoup(body, 'html.parser')
+        page_soup = self._confluence_process_images(page_soup, page_id, page_url)
+        md = self.html_to_markdown(page_soup)
+        fn = self._sanitize_title_filename(title)
+        with open(self.output_dir / fn, 'w', encoding='utf-8') as f:
+            f.write(f"# Source: {page_url}\n# Title: {title}\n\n---\n\n{md}")
+        print(f"  ✓ Saved: {fn}")
+
+        if self.single_page:
+            print("-" * 60)
+            print("Scraping complete! 1/1 page(s)")
+            print(f"Files saved to: {self.output_dir.absolute()}")
+            return
+
+        linked_titles = self._confluence_extract_links(body)
+        print(f"\nFound {len(linked_titles)} linked pages to scrape")
+        print("-" * 60)
+
+        if not linked_titles:
+            print("No linked pages found in the content.")
+            print(f"Files saved to: {self.output_dir.absolute()}")
+            return
+
+        successful = 0
+        for i, link_title in enumerate(linked_titles, 1):
+            print(f"[{i}/{len(linked_titles)}] Fetching: {link_title}")
+
+            linked_page = self._confluence_search_page(link_title, space_key)
+            if not linked_page:
+                print(f"  ✗ Page not found: {link_title}")
+                continue
+
+            lp_body = linked_page.get('body', {}).get('storage', {}).get('value', '')
+            lp_id = linked_page['id']
+            lp_title = linked_page.get('title', link_title)
+            lp_url = f"{base_origin}/wiki/spaces/{space_key}/pages/{lp_id}"
+
+            lp_soup = BeautifulSoup(lp_body, 'html.parser')
+            lp_soup = self._confluence_process_images(lp_soup, lp_id, lp_url)
+            lp_md = self.html_to_markdown(lp_soup)
+            lp_fn = self._sanitize_title_filename(lp_title)
+
+            with open(self.output_dir / lp_fn, 'w', encoding='utf-8') as f:
+                f.write(
+                    f"# Source: {lp_url}\n# Title: {lp_title}\n\n---\n\n{lp_md}"
+                )
+            print(f"  ✓ Saved: {lp_fn} ({len(lp_md)} chars)")
+            successful += 1
+
+            time.sleep(self.delay)
+
+        print("-" * 60)
+        print(f"Scraping complete! {successful}/{len(linked_titles)} page(s)")
+        if self.download_images:
+            print(f"Downloaded images: {len(self.downloaded_images)}")
+        print(f"Files saved to: {self.output_dir.absolute()}")
+
+    # ── Standard HTML Scraping ───────────────────────────────────────────
+
     def fetch_page(self, url: str) -> BeautifulSoup:
         """Fetch and parse a page."""
         try:
@@ -451,6 +693,14 @@ class DocumentationScraper:
         print(f"Mode: {mode}")
         print(f"Output directory: {self.output_dir.absolute()}")
         print(f"Image downloads: {'Enabled' if self.download_images else 'Disabled'}")
+
+        # Confluence Cloud: prefer the REST API over HTML scraping
+        if self._is_confluence_url(self.base_url):
+            print(f"Scraper: Confluence REST API (auto-detected)")
+            print("-" * 60)
+            self.scrape_confluence_api()
+            return
+
         print(f"Excluding selectors: {', '.join(self.exclude_selectors)}")
         print("-" * 60)
         
@@ -501,6 +751,10 @@ def main():
 Examples:
   # Basic usage
   python scrape_docs.py https://docs.example.com/guide
+
+  # Confluence Cloud (auto-detected, uses REST API)
+  python scrape_docs.py https://mysite.atlassian.net/wiki/spaces/DOC/pages/123/TOC \\
+    --cookie-file cookies.txt -o my_docs
   
   # Custom output directory
   python scrape_docs.py https://docs.example.com/guide --output-dir my_docs

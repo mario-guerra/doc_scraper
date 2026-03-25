@@ -12,6 +12,7 @@ A Python script that scrapes documentation pages and converts them to markdown f
 - ⏱️ **Respectful Scraping**: Built-in delays between requests
 - 🎨 **Customizable**: Configurable selectors and output options
 - ⚡ **JavaScript Support**: Handles dynamic content with Selenium (scrape_docs_dynamic.py)
+- 🏢 **Confluence Cloud Support**: Auto-detects Atlassian Confluence URLs and uses the REST API for fast, reliable extraction
 
 ## Installation
 
@@ -102,6 +103,33 @@ optional arguments:
                         CSS selector for elements to exclude (can be used multiple times)
   -d, --delay SECONDS   Delay between requests in seconds (default: 1.0)
 ```
+
+### Confluence Cloud
+
+Both scrapers **auto-detect** Confluence Cloud URLs (`*.atlassian.net/wiki/...`) and switch to the Confluence REST API automatically. This is faster and more reliable than scraping the rendered React UI.
+
+**Scrape a Confluence space from a Table of Contents page:**
+```bash
+python scrape_docs.py https://mysite.atlassian.net/wiki/spaces/DOC/pages/123456/Table+of+Contents \
+  --cookie-file cookies.txt \
+  --output-dir my_docs
+```
+
+**Scrape a single Confluence page:**
+```bash
+python scrape_docs_dynamic.py https://mysite.atlassian.net/wiki/spaces/DOC/pages/123456/My+Page \
+  --cookie-file cookies.txt \
+  --single-page
+```
+
+The Confluence API support:
+- Extracts page content via the REST API (`/wiki/rest/api/content/`)
+- Follows internal page links (`ac:link` / `ri:page` references)
+- Downloads image attachments from Confluence pages
+- Converts Confluence storage-format HTML to clean markdown
+- Works with both `scrape_docs.py` and `scrape_docs_dynamic.py`
+
+> **Note:** Confluence Cloud requires authentication. Export your browser cookies to a `cookies.txt` file — see the [Cookie Authentication Guide](COOKIE_AUTHENTICATION_GUIDE.md) for details.
 
 ## How It Works
 
